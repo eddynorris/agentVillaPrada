@@ -3,14 +3,17 @@ Tests de integración para Base de Datos Supabase y Servicios de Villa Prada.
 """
 import pytest
 import os
+import uuid
+from datetime import datetime, timedelta
 from src import database
 from src.services.chef_service import generar_lista_compras_chef
 from src.services.contract_service import generar_contrato_pdf
 
 
 def test_supabase_cliente_crud():
-    # Crear cliente de prueba
-    tel_test = "999000111"
+    # Crear cliente de prueba con teléfono único
+    random_suffix = str(uuid.uuid4().int)[:6]
+    tel_test = f"99{random_suffix}"
     cliente = database.obtener_o_crear_cliente(
         nombre="Cliente Test Supabase",
         telefono=tel_test,
@@ -23,22 +26,24 @@ def test_supabase_cliente_crud():
 
 
 def test_supabase_verificar_disponibilidad_y_crear_evento():
-    # 1. Crear cliente
-    cliente = database.obtener_o_crear_cliente("Maria Perez", "987111222")
+    random_suffix = str(uuid.uuid4().int)[:6]
+    tel_test = f"98{random_suffix}"
+    cliente = database.obtener_o_crear_cliente("Maria Perez", tel_test)
     
-    # 2. Fecha de prueba alejada
-    fecha = "2026-12-25"
+    # Fecha única para evitar conflicto con restricción de clave única (fecha_evento, turno)
+    fecha_futura = (datetime.now() + timedelta(days=200 + int(random_suffix) % 100)).strftime("%Y-%m-%d")
     turno = "cena"
     
-    # Verificar disponibilidad
-    disponible = database.verificar_disponibilidad_fecha(fecha, turno)
+    # 1. Verificar disponibilidad inicial
+    disponible_inicial = database.verificar_disponibilidad_fecha(fecha_futura, turno)
+    assert disponible_inicial is True
     
-    # 3. Crear evento
+    # 2. Crear evento
     evento = database.crear_evento(
         cliente_id=cliente['id'],
         tipo_evento="boda",
         paquete="premium",
-        fecha_evento=fecha,
+        fecha_evento=fecha_futura,
         turno=turno,
         nro_invitados=150,
         duracion_horas=8,
@@ -51,6 +56,10 @@ def test_supabase_verificar_disponibilidad_y_crear_evento():
     
     assert evento is not None
     assert evento['estado'] == 'tentativo'
+    
+    # 3. Verificar que la fecha AHORA está ocupada (prevención de doble reserva)
+    disponible_despues = database.verificar_disponibilidad_fecha(fecha_futura, turno)
+    assert disponible_despues is False
     
     # 4. Registrar pago de pre-reserva (S/300)
     pago = database.registrar_pago(
