@@ -1,0 +1,243 @@
+"""
+Motor de IA y NLU del Agente Secretario — Villa Prada.
+Usa Gemini 2.5 Flash con Function Calling para cotizaciones, reservas e interacción con clientes.
+"""
+import os
+import json
+import logging
+import google.generativeai as genai
+from typing import Dict, Any, Optional
+
+from src.calculator import calcular_cotizacion, CotizacionRequest
+from src import database
+
+logger = logging.getLogger(__name__)
+
+
+# System Prompt del Secretario Virtual
+SYSTEM_PROMPT = """Eres el Asistente Virtual Oficial y Secretario Comercial del Local de Eventos 'Villa Prada' en Andahuaylas, Perú.
+Tu trato es altamente profesional, cálido, formal y eficiente. Tu objetivo es cotizar eventos, verificar disponibilidad en calendario y guiar al cliente para realizar la pre-reserva de S/ 300.
+
+Reglas Comerciales de Villa Prada:
+- Servicios: Bodas, Quinceañeros, Eventos Institucionales y Alquiler de Local Implementado.
+- Duración base: 8 horas efectivas + 1 hora de tolerancia. Hora extra: S/ 300.
+- Tarifario por persona:
+  * Boda / 15 Años Premium: S/ 120 por persona.
+  * Boda / 15 Años Básico: S/ 100 por persona.
+  * Institucional: S/ 60 por persona.
+  * Alquiler de Local Implementado: S/ 4,000 (hasta 100 personas).
+- Descuento por Volumen (se aplica automáticamente al cotizar):
+  * <100 personas: +5% sobre base.
+  * 100-149 personas: Tarifa base.
+  * 150-199 personas: 5% de descuento.
+  * 200+ personas: 10% de descuento.
+- Proceso de Reserva:
+  1. Pre-reserva: S/ 300 (bloquea la fecha temporalmente).
+  2. Firma de Contrato: 30% de adelanto del total del evento.
+- Decoración Incluida: Frontal decorado + Zona Selfie (colores a elección del cliente) + Diseño alusivo en la Pantalla Gigante.
+
+Instrucciones:
+- Responde siempre de forma clara, amable y estructurada.
+- Usa las herramientas (functions) para calcular cotizaciones reales y verificar disponibilidad de fechas.
+- NUNCA inventes precios o fechas disponibles; usa las herramientas correspondientes.
+"""
+
+TOOLS = [
+    {
+        "function_declarations": [
+            {
+                "name": "cotizar_evento",
+                "description": "Calcula la cotización exacta para un evento aplicando descuentos por volumen y costos de horas extras.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "tipo_evento": {
+                            "type": "STRING",
+                            "description": "Tipo de evento.",
+                            "enum": ["boda", "quinceanero", "institucional", "alquiler_local"]
+                        },
+                        "paquete": {
+                            "type": "STRING",
+                            "description": "Paquete del evento.",
+                            "enum": ["basico", "premium", "no_aplica"]
+                        },
+                        "nro_invitados": {
+                            "type": "INTEGER",
+                            "description": "Número total de personas/invitados."
+                        },
+                        "horas_extras": {
+                            "type": "INTEGER",
+                            "description": "Número de horas adicionales (default 0)."
+                        }
+                    },
+                    "required": ["tipo_evento", "nro_invitados"]
+                }
+            },
+            {
+                "name": "verificar_disponibilidad",
+                "description": "Verifica si una fecha y turno (almuerzo o cena) están disponibles en el calendario de Villa Prada.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "fecha_evento": {
+                            "type": "STRING",
+                            "description": "Fecha del evento en formato YYYY-MM-DD."
+                        },
+                        "turno": {
+                            "type": "STRING",
+                            "description": "Turno deseado.",
+                            "enum": ["almuerzo", "cena"]
+                        }
+                    },
+                    "required": ["fecha_evento", "turno"]
+                }
+            },
+            {
+                "name": "crear_prereserva",
+                "description": "Crea una pre-reserva de evento para un cliente tras acordar fecha y paquete.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "nombre_cliente": {"type": "STRING", "description": "Nombre completo del cliente."},
+                        "telefono_cliente": {"type": "STRING", "description": "Número de teléfono celular de 9 dígitos."},
+                        "tipo_evento": {"type": "STRING", "enum": ["boda", "quinceanero", "institucional", "alquiler_local"]},
+                        "paquete": {"type": "STRING", "enum": ["basico", "premium", "no_aplica"]},
+                        "fecha_evento": {"type": "STRING", "description": "Fecha en formato YYYY-MM-DD."},
+                        "turno": {"type": "STRING", "enum": ["almuerzo", "cena"]},
+                        "nro_invitados": {"type": "INTEGER"},
+                        "horas_extras": {"type": "INTEGER"},
+                        "paleta_colores": {"type": "STRING", "description": "Colores preferidos para la decoración (ej: Azul y Plateado)."},
+                        "disenio_pantalla": {"type": "STRING", "description": "Texto/Mensaje para la pantalla gigante."}
+                    },
+                    "required": ["nombre_cliente", "telefono_cliente", "tipo_evento", "fecha_evento", "turno", "nro_invitados"]
+                }
+            }
+        ]
+    }
+]
+
+
+class VillaPradaAgent:
+    def __init__(self):
+        api_key = os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            logger.warning("GOOGLE_API_KEY no configurada.")
+        else:
+            genai.configure(api_key=api_key)
+            
+        self.model = genai.GenerativeModel(
+            model_name="gemini-2.5-flash",
+            tools=TOOLS,
+            system_instruction=SYSTEM_PROMPT
+        )
+
+    def process_message(self, user_text: str, history: list = None) -> dict:
+        """Procesa un mensaje del cliente y maneja llamadas a funciones dinámicas."""
+        contents = []
+        if history and isinstance(history, list):
+            for h in history:
+                contents.append(h)
+        
+        contents.append({"role": "user", "parts": [user_text]})
+
+        try:
+            response = self.model.generate_content(contents)
+            if not response.candidates:
+                return {"text": "Disculpa, no pude procesar tu solicitud. ¿Podrías repetirla?", "action": None}
+
+            parts = response.candidates[0].content.parts
+            fn_call = next((p.function_call for p in parts if getattr(p, 'function_call', None)), None)
+            text_resp = next((p.text for p in parts if getattr(p, 'text', None)), None)
+
+            if fn_call:
+                fn_name = fn_call.name
+                fn_args = dict(fn_call.args)
+
+                # 1. Ejecutar cotización
+                if fn_name == "cotizar_evento":
+                    req = CotizacionRequest(
+                        tipo_evento=fn_args.get("tipo_evento", "boda"),
+                        paquete=fn_args.get("paquete", "basico"),
+                        nro_invitados=int(fn_args.get("nro_invitados", 100)),
+                        horas_extras=int(fn_args.get("horas_extras", 0))
+                    )
+                    cot = calcular_cotizacion(req)
+                    res_text = (
+                        f"📊 <b>Cotización Personalizada - Villa Prada</b>\n\n"
+                        f"• <b>Evento:</b> {cot.tipo_evento.upper()} ({cot.paquete.upper()})\n"
+                        f"• <b>Invitados:</b> {cot.nro_invitados} personas\n"
+                        f"• <b>Precio por Persona:</b> S/ {cot.precio_unitario_pax:.2f}\n"
+                        f"• <b>Subtotal Evento:</b> S/ {cot.subtotal_evento:.2f}\n"
+                    )
+                    if cot.horas_extras > 0:
+                        res_text += f"• <b>Horas Extras ({cot.horas_extras}h):</b> S/ {cot.horas_extras_monto:.2f}\n"
+                    
+                    res_text += (
+                        f"\n💰 <b>TOTAL ESTIMADO:</b> S/ {cot.total_general:.2f}\n\n"
+                        f"📌 <b>Pasos para Reservar:</b>\n"
+                        f"1. Pre-reserva tu fecha con solo <b>S/ {cot.monto_prereserva:.2f}</b>\n"
+                        f"2. Firma de contrato con el 30% de adelanto (S/ {cot.monto_adelanto_contrato_30pct:.2f})\n\n"
+                        f"✨ <b>Incluye:</b> 8h de evento + 1h tolerancia, mozos ({cot.mozos_requeridos} asignados), estructura frontal, zona selfie y pantalla gigante.\n\n"
+                        f"¿Deseas consultar la disponibilidad de alguna fecha?"
+                    )
+                    return {"text": res_text, "action": "cotizacion", "data": cot.model_dump()}
+
+                # 2. Verificar disponibilidad
+                elif fn_name == "verificar_disponibilidad":
+                    fecha = fn_args.get("fecha_evento")
+                    turno = fn_args.get("turno")
+                    disponible = database.verificar_disponibilidad_fecha(fecha, turno)
+                    if disponible:
+                        res_text = f"✅ ¡Excelente noticia! La fecha <b>{fecha}</b> en el turno de la <b>{turno.upper()}</b> está <b>DISPONIBLE</b> en Villa Prada. 🎉\n\n¿Te gustaría pre-reservarla con S/ 300?"
+                    else:
+                        res_text = f"⚠️ Lo sentimos, la fecha <b>{fecha}</b> en el turno de la <b>{turno.upper()}</b> ya se encuentra reservada. ¿Deseas consultar otra fecha o turno?"
+                    return {"text": res_text, "action": "disponibilidad", "disponible": disponible}
+
+                # 3. Crear pre-reserva
+                elif fn_name == "crear_prereserva":
+                    cliente = database.obtener_o_crear_cliente(
+                        nombre=fn_args.get("nombre_cliente"),
+                        telefono=fn_args.get("telefono_cliente")
+                    )
+                    
+                    # Cotizar para obtener totales
+                    req = CotizacionRequest(
+                        tipo_evento=fn_args.get("tipo_evento", "boda"),
+                        paquete=fn_args.get("paquete", "basico"),
+                        nro_invitados=int(fn_args.get("nro_invitados", 100)),
+                        horas_extras=int(fn_args.get("horas_extras", 0))
+                    )
+                    cot = calcular_cotizacion(req)
+
+                    evento = database.crear_evento(
+                        cliente_id=cliente['id'],
+                        tipo_evento=cot.tipo_evento,
+                        paquete=cot.paquete,
+                        fecha_evento=fn_args.get("fecha_evento"),
+                        turno=fn_args.get("turno"),
+                        nro_invitados=cot.nro_invitados,
+                        duracion_horas=8,
+                        horas_extras=cot.horas_extras,
+                        precio_por_pax=cot.precio_unitario_pax,
+                        total_estimado=cot.total_general,
+                        paleta_colores=fn_args.get("paleta_colores"),
+                        disenio_pantalla=fn_args.get("disenio_pantalla")
+                    )
+
+                    res_text = (
+                        f"🎉 <b>¡Pre-reserva Creada con Éxito!</b>\n\n"
+                        f"• <b>Evento ID:</b> #{str(evento['id'])[:8]}\n"
+                        f"• <b>Cliente:</b> {cliente['nombre']}\n"
+                        f"• <b>Fecha:</b> {evento['fecha_evento']} ({evento['turno'].upper()})\n"
+                        f"• <b>Total Evento:</b> S/ {cot.total_general:.2f}\n\n"
+                        f"💳 <b>Para bloquear oficialmente la fecha:</b>\n"
+                        f"Realiza el abono de pre-reserva de <b>S/ 300.00</b> vía Yape/Plin o transferencia.\n\n"
+                        f"📱 Un asesor te contactará para coordinar la firma del contrato y adelanto del 30%."
+                    )
+                    return {"text": res_text, "action": "prereserva_creada", "evento": evento}
+
+            return {"text": text_resp or "Entendido, ¿en qué más te puedo ayudar?", "action": None}
+
+        except Exception as e:
+            logger.error(f"Error en VillaPradaAgent: {e}", exc_info=True)
+            return {"text": "Disculpa, ocurrió un error interno al consultar el sistema. Por favor intenta de nuevo.", "action": "error"}
